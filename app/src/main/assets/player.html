@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>YT Playlist Player</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; background: #000; height: 100%; overflow: hidden;
+    font-family: sans-serif; color: #fff;
+  }
+  #playerWrap { position: fixed; top: 0; left: 0; width: 100%; height: 100%; }
+  #player { width: 100%; height: 100%; }
+
+  /* ---- bottom overlay ---- */
+  #overlay {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; box-sizing: border-box;
+    background: linear-gradient(to top, rgba(0,0,0,0.85), rgba(0,0,0,0));
+    z-index: 50;
+  }
+  #timerText { font-size: 15px; font-weight: 600; }
+  #counterText { font-size: 12px; opacity: 0.8; margin-top: 2px; }
+  #nextBtn {
+    background: #e50914; color: #fff; border: none; border-radius: 20px;
+    padding: 10px 18px; font-size: 14px; font-weight: 600;
+  }
+
+  /* ---- gear / settings toggle ---- */
+  #gearBtn {
+    position: fixed; top: 14px; right: 14px; z-index: 60;
+    background: rgba(0,0,0,0.55); color: #fff; border: none;
+    width: 40px; height: 40px; border-radius: 20px; font-size: 18px;
+  }
+
+  /* ---- settings panel ---- */
+  #panel {
+    position: fixed; top: 0; right: 0; width: 86%; max-width: 380px; height: 100%;
+    background: #141414; z-index: 70; box-sizing: border-box; padding: 16px;
+    overflow-y: auto; transform: translateX(100%); transition: transform 0.25s ease;
+  }
+  #panel.open { transform: translateX(0); }
+  #panel h2 { font-size: 16px; margin: 4px 0 12px; }
+  #panel label { font-size: 12px; opacity: 0.8; display: block; margin-top: 10px; }
+  #panel input {
+    width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px;
+    border-radius: 6px; border: 1px solid #333; background: #1f1f1f; color: #fff;
+  }
+  #addBtn, #closeBtn {
+    margin-top: 12px; width: 100%; padding: 10px; border: none; border-radius: 6px;
+    background: #e50914; color: #fff; font-weight: 600;
+  }
+  #closeBtn { background: #333; margin-bottom: 14px; }
+  #linkList { margin-top: 14px; }
+  .linkRow {
+    display: flex; align-items: center; justify-content: space-between;
+    background: #1f1f1f; padding: 8px; border-radius: 6px; margin-bottom: 6px; font-size: 12px;
+  }
+  .linkRow.active { border: 1px solid #e50914; }
+  .linkRow .info { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%; }
+  .linkRow button { background: #444; color: #fff; border: none; border-radius: 4px; padding: 4px 8px; }
+</style>
+</head>
+<body>
+
+<div id="playerWrap"><div id="player"></div></div>
+
+<button id="gearBtn">⚙</button>
+
+<div id="overlay">
+  <div>
+    <div id="timerText">--:--</div>
+    <div id="counterText">Video 0/0</div>
+  </div>
+  <button id="nextBtn">Next ▶</button>
+</div>
+
+<div id="panel">
+  <button id="closeBtn">Close</button>
+  <h2>Default duration (minutes)</h2>
+  <input id="defaultDuration" type="number" min="1" value="20">
+
+  <h2>Add a video link</h2>
+  <label>YouTube link or video ID</label>
+  <input id="newUrl" type="text" placeholder="https://youtube.com/watch?v=...">
+  <label>Duration for this video (minutes) — leave blank to use default</label>
+  <input id="newDuration" type="number" min="1" placeholder="e.g. 10">
+  <button id="addBtn">Add to playlist</button>
+
+  <h2>Playlist</h2>
+  <div id="linkList"></div>
+</div>
+
+<script>
+  // ---------- storage helpers ----------
+  const STORAGE_KEY = "yt_playlist_v1";
+  const DEFAULT_DURATION_KEY = "yt_default_duration_min";
+
+  function loadPlaylist() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) { return []; }
+  }
+  function savePlaylist(list) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+  }
+  function loadDefaultDuration() {
+    const v = localStorage.getItem(DEFAULT_DURATION_KEY);
+    return v ? parseInt(v, 10) : 20;
+  }
+  function saveDefaultDuration(min) {
+    localStorage.setItem(DEFAULT_DURATION_KEY, String(min));
+  }
+
+  // extract an 11-char YouTube video id from any common URL shape, or accept raw id
+  function extractVideoId(input) {
+    input = input.trim();
+    if (/^[a-zA-Z0-9_-]{11}$/.test(input)) return input;
+    const patterns = [
+      /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+      /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+      /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+      /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+      /[?&]v=([a-zA-Z0-9_-]{11})/
+    ];
+    for (const p of patterns) {
+      const m = input.match(p);
+      if (m) return m[1];
+    }
+    return null;
+  }
+
+  // ---------- state ----------
+  let playlist = loadPlaylist();       // [{id, durationMin}]
+  let defaultDuration = loadDefaultDuration();
+  let currentIndex = 0;
+  let player = null;
+  let secondsLeft = 0;
+  let tickHandle = null;
+
+  document.getElementById("defaultDuration").value = defaultDuration;
+
+  // ---------- UI: panel ----------
+  const panel = document.getElementById("panel");
+  document.getElementById("gearBtn").onclick = () => panel.classList.add("open");
+  document.getElementById("closeBtn").onclick = () => panel.classList.remove("open");
+
+  document.getElementById("defaultDuration").onchange = (e) => {
+    defaultDuration = Math.max(1, parseInt(e.target.value || "20", 10));
+    saveDefaultDuration(defaultDuration);
+  };
+
+  document.getElementById("addBtn").onclick = () => {
+    const urlField = document.getElementById("newUrl");
+    const durField = document.getElementById("newDuration");
+    const id = extractVideoId(urlField.value);
+    if (!id) { alert("Valid YouTube link ya video ID daalein"); return; }
+    const dur = durField.value ? Math.max(1, parseInt(durField.value, 10)) : null;
+    playlist.push({ id: id, durationMin: dur });
+    savePlaylist(playlist);
+    urlField.value = ""; durField.value = "";
+    renderList();
+    if (playlist.length === 1) startAt(0);
+  };
+
+  function removeAt(i) {
+    playlist.splice(i, 1);
+    savePlaylist(playlist);
+    if (i === currentIndex && playlist.length) startAt(Math.min(currentIndex, playlist.length - 1));
+    else if (!playlist.length) { clearInterval(tickHandle); document.getElementById("timerText").textContent = "No videos"; }
+    renderList();
+  }
+
+  function renderList() {
+    const wrap = document.getElementById("linkList");
+    wrap.innerHTML = "";
+    playlist.forEach((item, i) => {
+      const row = document.createElement("div");
+      row.className = "linkRow" + (i === currentIndex ? " active" : "");
+      const dur = item.durationMin || defaultDuration;
+      row.innerHTML = `<div class="info">#${i + 1} • ${item.id} • ${dur} min</div>`;
+      const btn = document.createElement("button");
+      btn.textContent = "Remove";
+      btn.onclick = () => removeAt(i);
+      row.appendChild(btn);
+      wrap.appendChild(row);
+    });
+    document.getElementById("counterText").textContent =
+      playlist.length ? `Video ${currentIndex + 1}/${playlist.length}` : "Video 0/0";
+  }
+
+  // ---------- YouTube IFrame API ----------
+  let apiReady = false;
+  function onYouTubeIframeAPIReady() {
+    apiReady = true;
+    if (playlist.length) {
+      player = new YT.Player('player', {
+        videoId: playlist[currentIndex].id,
+        playerVars: { autoplay: 1, playsinline: 1, rel: 0, modestbranding: 1 },
+        events: {
+          onReady: (e) => { e.target.playVideo(); beginTimer(); },
+          onStateChange: onPlayerStateChange
+        }
+      });
+    }
+  }
+  window.onYouTubeIframeAPIReady = onYouTubeIframeAPIReady;
+
+  function onPlayerStateChange(e) {
+    // if the actual video is shorter than the set duration, loop it
+    // until the timer finishes, instead of jumping ahead early.
+    if (e.data === YT.PlayerState.ENDED) {
+      player.seekTo(0, true);
+      player.playVideo();
+    }
+  }
+
+  function startAt(index) {
+    currentIndex = index;
+    const item = playlist[currentIndex];
+    if (!item) return;
+    if (player && apiReady) {
+      player.loadVideoById(item.id);
+    }
+    beginTimer();
+    renderList();
+  }
+
+  function beginTimer() {
+    clearInterval(tickHandle);
+    const item = playlist[currentIndex];
+    const minutes = (item && item.durationMin) ? item.durationMin : defaultDuration;
+    secondsLeft = minutes * 60;
+    updateTimerText();
+    tickHandle = setInterval(() => {
+      secondsLeft--;
+      updateTimerText();
+      if (secondsLeft <= 0) {
+        goNext();
+      }
+    }, 1000);
+  }
+
+  function updateTimerText() {
+    const m = Math.floor(secondsLeft / 60);
+    const s = secondsLeft % 60;
+    document.getElementById("timerText").textContent =
+      (secondsLeft > 0 ? m + ":" + String(s).padStart(2, "0") + " left" : "0:00");
+  }
+
+  function goNext() {
+    if (!playlist.length) return;
+    const next = (currentIndex + 1) % playlist.length;
+    startAt(next);
+  }
+
+  document.getElementById("nextBtn").onclick = goNext;
+
+  // ---------- load YouTube IFrame API script ----------
+  const tag = document.createElement('script');
+  tag.src = "https://www.youtube.com/iframe_api";
+  document.body.appendChild(tag);
+
+  renderList();
+</script>
+</body>
+</html>
